@@ -222,6 +222,75 @@ type ScanInfo struct {
 	BaselineGranularity       string            // Comparison unit for the baseline diff: "evidence" (default) or "control"
 	KubeContexts              []string          // --kube-contexts: scan each of these kube contexts sequentially, one report per context (fleet mode)
 	FleetReport               string            // --fleet-report: with --kube-contexts, also write one combined JSON report across every context to this path
+	WholeClusterPolicy        WholeClusterExecutionPolicy // Execution policy for whole-cluster controls (projected, fallback, skip, verify)
+}
+
+type WholeClusterExecutionPolicy string
+
+const (
+	// WholeClusterPolicyProjected accumulates only resources matching whole-cluster controls
+	// across batches, maintaining cross-namespace join correctness while keeping peak memory bounded.
+	WholeClusterPolicyProjected WholeClusterExecutionPolicy = "projected"
+
+	// WholeClusterPolicyFallback materializes all resources across the entire cluster into memory
+	// for whole-cluster control evaluation.
+	WholeClusterPolicyFallback WholeClusterExecutionPolicy = "fallback"
+
+	// WholeClusterPolicySkip bypasses whole-cluster controls entirely, marking them as skipped
+	// in scan coverage for strict memory bounds.
+	WholeClusterPolicySkip WholeClusterExecutionPolicy = "skip"
+
+	// WholeClusterPolicyVerify evaluates whole-cluster controls using both projected and fallback scopes
+	// and diffs verdicts across all evaluated resources (debug/cross-check mode).
+	WholeClusterPolicyVerify WholeClusterExecutionPolicy = "verify"
+)
+
+// ValidateWholeClusterPolicy validates that the policy is one of the supported values.
+func ValidateWholeClusterPolicy(policy WholeClusterExecutionPolicy) error {
+	switch policy {
+	case WholeClusterPolicyProjected, WholeClusterPolicyFallback, WholeClusterPolicySkip, WholeClusterPolicyVerify:
+		return nil
+	default:
+		return fmt.Errorf("invalid whole-cluster policy %q: supported policies are %q, %q, %q, %q",
+			policy, WholeClusterPolicyProjected, WholeClusterPolicyFallback, WholeClusterPolicySkip, WholeClusterPolicyVerify)
+	}
+}
+
+// ResolveWholeClusterPolicy determines the effective WholeClusterExecutionPolicy:
+// explicit string if provided, then KUBESCAPE_WHOLE_CLUSTER_POLICY, then KUBESCAPE_WHOLE_CLUSTER_PARITY_CHECK,
+// defaulting to WholeClusterPolicyProjected.
+func ResolveWholeClusterPolicy(explicitPolicy string) (WholeClusterExecutionPolicy, error) {
+	if explicitPolicy != "" {
+		p := WholeClusterExecutionPolicy(strings.ToLower(strings.TrimSpace(explicitPolicy)))
+		if err := ValidateWholeClusterPolicy(p); err != nil {
+			return "", err
+		}
+		return p, nil
+	}
+	if envVal := os.Getenv("KUBESCAPE_WHOLE_CLUSTER_POLICY"); envVal != "" {
+		p := WholeClusterExecutionPolicy(strings.ToLower(strings.TrimSpace(envVal)))
+		if err := ValidateWholeClusterPolicy(p); err != nil {
+			return "", err
+		}
+		return p, nil
+	}
+	if strings.EqualFold(os.Getenv("KUBESCAPE_WHOLE_CLUSTER_PARITY_CHECK"), "true") {
+		return WholeClusterPolicyVerify, nil
+	}
+	return WholeClusterPolicyProjected, nil
+}
+
+// GetWholeClusterPolicy returns the resolved WholeClusterExecutionPolicy for scanInfo.
+func (scanInfo *ScanInfo) GetWholeClusterPolicy() WholeClusterExecutionPolicy {
+	if scanInfo == nil || scanInfo.WholeClusterPolicy == "" {
+		p, _ := ResolveWholeClusterPolicy("")
+		return p
+	}
+	p, err := ResolveWholeClusterPolicy(string(scanInfo.WholeClusterPolicy))
+	if err != nil {
+		return WholeClusterPolicyProjected
+	}
+	return p
 }
 
 type Getters struct {
