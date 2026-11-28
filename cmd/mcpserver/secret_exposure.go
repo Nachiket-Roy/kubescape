@@ -27,12 +27,6 @@ var configMapGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resourc
 
 var (
 	sensitiveEnvKeyRegex = regexp.MustCompile(`(?i)(?:(?:^|_|-|\.)(?:PASSWORD|PASSWD|SECRET|TOKEN|API[._-]KEY|APIKEY|AUTH[._-]TOKEN|AUTH[._-]CONFIG|PRIVATE[._-]KEY|ACCESS[._-]KEY|CLIENT[._-]SECRET|DATABASE[._-]URL|DB[._-]PASS|DB[._-]PASSWORD|CREDENTIALS?|SSH[._-]AUTH[._-]SOCK|DOCKER[._-]AUTH[._-]CONFIG|JWT|BEARER)|PGPASS(?:WORD|WD)|[A-Za-z0-9_]+_PWD)(?:$|_|-|\.)`)
-	privateKeyRegex      = regexp.MustCompile(`-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----`)
-	awsAccessKeyRegex    = regexp.MustCompile(`\b(?:AKIA|ASIA)[0-9A-Z]{16}\b`)
-	githubTokenRegex     = regexp.MustCompile(`\b(?:gh[pousr]_[A-Za-z0-9_]{36,}|github_pat_[A-Za-z0-9_]{22,})\b`)
-	slackTokenRegex      = regexp.MustCompile(`\bxox[baprs]-[0-9A-Za-z]{10,}-[0-9A-Za-z]+\b`)
-	jwtTokenRegex        = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]{10,}\.[A-Za-z0-9._-]+\b`)
-	uriCredentialsRegex  = regexp.MustCompile(`\b[a-zA-Z][a-zA-Z0-9+.-]*://((?:\{\{[^{}]*\}\}|[^:\s@/?#])+):((?:\{\{[^{}]*\}\}|[^\s/?#])+)@[^/?#,;|\s"'` + "`" + `]+`)
 	uriStartRegex        = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9+.-]*://`)
 
 	sensitiveConfigMapFileRegex = regexp.MustCompile(`(?i)(?:id_rsa|id_ecdsa|id_ed25519|credentials\.json|\.env|jwt\.key)$`)
@@ -201,52 +195,6 @@ func maskConfigFileSecret(key, val string) string {
 	return maskSecret(val)
 }
 
-type valuePattern struct {
-	ruleID      string
-	regex       *regexp.Regexp
-	description string
-	severity    string
-}
-
-var highConfidenceValuePatterns = []valuePattern{
-	{
-		ruleID:      "PRIVATE_KEY_HEADER",
-		regex:       privateKeyRegex,
-		description: "Private key detected in configuration data",
-		severity:    "Critical",
-	},
-	{
-		ruleID:      "GITHUB_TOKEN",
-		regex:       githubTokenRegex,
-		description: "GitHub personal access token detected in configuration data",
-		severity:    "Critical",
-	},
-	{
-		ruleID:      "AWS_ACCESS_KEY_ID",
-		regex:       awsAccessKeyRegex,
-		description: "AWS Access Key ID detected in configuration data",
-		severity:    "High",
-	},
-	{
-		ruleID:      "SLACK_TOKEN",
-		regex:       slackTokenRegex,
-		description: "Slack API token detected in configuration data",
-		severity:    "High",
-	},
-	{
-		ruleID:      "JWT_TOKEN",
-		regex:       jwtTokenRegex,
-		description: "JSON Web Token (JWT) detected in configuration data",
-		severity:    "High",
-	},
-	{
-		ruleID:      "URI_CREDENTIALS",
-		regex:       uriCredentialsRegex,
-		description: "Connection URI with embedded credentials detected in configuration data",
-		severity:    "High",
-	},
-}
-
 func hasExposedQueryCredentials(queryStr string) bool {
 	for _, segment := range strings.FieldsFunc(queryStr, func(r rune) bool {
 		return r == '&' || r == ';' || r == '?' || r == '#'
@@ -277,7 +225,7 @@ func hasExposedQueryCredentials(queryStr string) bool {
 			if unescapedV, err := url.QueryUnescape(v); err == nil {
 				v = unescapedV
 			}
-			if awsAccessKeyRegex.MatchString(v) || githubTokenRegex.MatchString(v) || slackTokenRegex.MatchString(v) || jwtTokenRegex.MatchString(v) {
+			if isHighConfidenceToken(v) {
 				return true
 			}
 			if isCredentialKey {
@@ -304,11 +252,7 @@ func hasExposedURICredentials(val string) (hasMatch bool, hasExposed bool, safeR
 		user := val[loc[2]:loc[3]]
 		pass := val[loc[4]:loc[5]]
 
-		isAuthExposed := !isCompletePlaceholderExpression(pass) ||
-			awsAccessKeyRegex.MatchString(user) ||
-			githubTokenRegex.MatchString(user) ||
-			slackTokenRegex.MatchString(user) ||
-			jwtTokenRegex.MatchString(user)
+		isAuthExposed := !isCompletePlaceholderExpression(pass) || isHighConfidenceToken(user)
 
 		pos := loc[1]
 		for pos < len(val) {
@@ -336,39 +280,50 @@ func hasExposedURICredentials(val string) (hasMatch bool, hasExposed bool, safeR
 }
 
 func evaluateSecretString(key, val string) (matched bool, ruleID, desc, severity string) {
-	for _, p := range highConfidenceValuePatterns {
-		if p.ruleID == "URI_CREDENTIALS" {
-			hasMatch, hasExposed, safeRanges := hasExposedURICredentials(val)
-			if hasExposed {
-				return true, p.ruleID, p.description, p.severity
-			}
-			if hasMatch {
-				// URI credentials were present and all matched URIs are safe.
-				// Exempt only the safe URI portions and evaluate remaining compound content.
-				var b strings.Builder
-				lastIdx := 0
-				for _, r := range safeRanges {
-					if r[0] > lastIdx {
-						b.WriteString(val[lastIdx:r[0]])
-					}
-					if r[1] > lastIdx {
-						lastIdx = r[1]
-					}
-				}
-				if lastIdx < len(val) {
-					b.WriteString(val[lastIdx:])
-				}
-				remaining := strings.Trim(b.String(), " \t\r\n,;|\"'`")
+	rules := defaultSecretRuleRegistry.Rules()
 
-				if remaining == "" {
-					return false, "", "", ""
-				}
-				return evaluateSecretString(key, remaining)
-			}
+	// 1. Evaluate all non-URI token/key rules against the full value first.
+	// This ensures that high-confidence token rules (including custom rules added via
+	// Register or LoadRulesFromJSON) are matched even if embedded in a URI with safe credentials.
+	var uriRule *SecretRule
+	for i := range rules {
+		if rules[i].ID == "URI_CREDENTIALS" {
+			uriRule = &rules[i]
 			continue
 		}
-		if p.regex.MatchString(val) {
-			return true, p.ruleID, p.description, p.severity
+		if rules[i].Matches(val) {
+			return true, rules[i].ID, rules[i].Description, rules[i].Severity
+		}
+	}
+
+	// 2. Evaluate URI credentials and apply safe placeholder exemption if applicable.
+	if uriRule != nil {
+		hasMatch, hasExposed, safeRanges := hasExposedURICredentials(val)
+		if hasExposed {
+			return true, uriRule.ID, uriRule.Description, uriRule.Severity
+		}
+		if hasMatch {
+			// URI credentials were present and all matched URIs are safe.
+			// Exempt only the safe URI portions and evaluate remaining compound content.
+			var b strings.Builder
+			lastIdx := 0
+			for _, r := range safeRanges {
+				if r[0] > lastIdx {
+					b.WriteString(val[lastIdx:r[0]])
+				}
+				if r[1] > lastIdx {
+					lastIdx = r[1]
+				}
+			}
+			if lastIdx < len(val) {
+				b.WriteString(val[lastIdx:])
+			}
+			remaining := strings.Trim(b.String(), " \t\r\n,;|\"'`")
+
+			if remaining == "" {
+				return false, "", "", ""
+			}
+			return evaluateSecretString(key, remaining)
 		}
 	}
 
